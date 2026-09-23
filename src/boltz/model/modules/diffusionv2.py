@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from math import sqrt
 
 import numpy as np
@@ -27,6 +28,7 @@ from boltz.model.modules.transformersv2 import (
 )
 from boltz.model.modules.utils import (
     LinearNoBias,
+    autocast_device_type,
     center_random_augmentation,
     compute_random_augmentation,
     default,
@@ -121,6 +123,7 @@ class DiffusionModule(Module):
         feats,
         diffusion_conditioning,
         multiplicity=1,
+        low_memory=False,
     ):
         if self.activation_checkpointing and self.training:
             s, normed_fourier = torch.utils.checkpoint.checkpoint(
@@ -141,7 +144,11 @@ class DiffusionModule(Module):
             feats=feats,
             q=diffusion_conditioning["q"].float(),
             c=diffusion_conditioning["c"].float(),
-            atom_enc_bias=diffusion_conditioning["atom_enc_bias"].float(),
+            atom_enc_bias=(
+                diffusion_conditioning["atom_enc_bias"]
+                if low_memory
+                else diffusion_conditioning["atom_enc_bias"].float()
+            ),
             to_keys=diffusion_conditioning["to_keys"],
             r=r_noisy,  # Float['b m 3'],
             multiplicity=multiplicity,
@@ -155,9 +162,12 @@ class DiffusionModule(Module):
             a,
             mask=mask.float(),
             s=s,
-            bias=diffusion_conditioning[
-                "token_trans_bias"
-            ].float(),  # note z is not expanded with multiplicity until after bias is computed
+            # AttentionPairBias converts only the current layer's bias to FP32.
+            bias=(
+                diffusion_conditioning["token_trans_bias"]
+                if low_memory
+                else diffusion_conditioning["token_trans_bias"].float()
+            ),
             multiplicity=multiplicity,
         )
         a = self.a_norm(a)
@@ -167,7 +177,11 @@ class DiffusionModule(Module):
             a=a,
             q=q_skip,
             c=c_skip,
-            atom_dec_bias=diffusion_conditioning["atom_dec_bias"].float(),
+            atom_dec_bias=(
+                diffusion_conditioning["atom_dec_bias"]
+                if low_memory
+                else diffusion_conditioning["atom_dec_bias"].float()
+            ),
             feats=feats,
             multiplicity=multiplicity,
             to_keys=to_keys,
@@ -253,6 +267,7 @@ class AtomDiffusion(Module):
         noised_atom_coords,  #: Float['b m 3'],
         sigma,  #: Float['b'] | Float[' '] | float,
         network_condition_kwargs: dict,
+        diffusion_precision=None,
     ):
         batch, device = noised_atom_coords.shape[0], noised_atom_coords.device
 
@@ -261,11 +276,29 @@ class AtomDiffusion(Module):
 
         padded_sigma = rearrange(sigma, "b -> b 1 1")
 
-        r_update = self.score_model(
-            r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
-            times=self.c_noise(sigma),
-            **network_condition_kwargs,
+        # Only the neural network runs under AMP. Noise, preconditioning and
+        # integration retain FP32 throughout the sampling trajectory.
+        r_noisy = self.c_in(padded_sigma) * noised_atom_coords
+        times = self.c_noise(sigma)
+        context = (
+            torch.autocast(
+                autocast_device_type(device.type),
+                enabled=diffusion_precision != "32-true",
+                dtype=(
+                    torch.float16
+                    if diffusion_precision == "16-mixed"
+                    else torch.bfloat16
+                ),
+            )
+            if diffusion_precision is not None
+            else nullcontext()
         )
+        with context:
+            r_update = self.score_model(
+                r_noisy=r_noisy, times=times, **network_condition_kwargs
+            )
+        if diffusion_precision is not None:
+            r_update = r_update.float()
 
         denoised_coords = (
             self.c_skip(padded_sigma) * noised_atom_coords
@@ -299,8 +332,14 @@ class AtomDiffusion(Module):
         multiplicity=1,
         max_parallel_samples=None,
         steering_args=None,
+        diffusion_precision=None,
+        low_memory=False,
         **network_condition_kwargs,
     ):
+        if max_parallel_samples is not None and max_parallel_samples < 1:
+            raise ValueError("max_parallel_samples must be positive.")
+        if low_memory:
+            network_condition_kwargs["low_memory"] = True
         if steering_args is not None and (
             steering_args["fk_steering"]
             or steering_args["physical_guidance_update"]
@@ -379,21 +418,22 @@ class AtomDiffusion(Module):
 
             with torch.no_grad():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
-                sample_ids = torch.arange(multiplicity, device=atom_coords_noisy.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    multiplicity % max_parallel_samples + 1
-                )
-
-                for sample_ids_chunk in sample_ids_chunks:
+                # Use views and a batch-size limit, not a number of chunks.
+                for start in range(0, atom_coords_noisy.shape[0], max_parallel_samples):
+                    stop = min(
+                        start + max_parallel_samples, atom_coords_noisy.shape[0]
+                    )
                     atom_coords_denoised_chunk = self.preconditioned_network_forward(
-                        atom_coords_noisy[sample_ids_chunk],
+                        atom_coords_noisy[start:stop],
                         t_hat,
                         network_condition_kwargs=dict(
-                            multiplicity=sample_ids_chunk.numel(),
+                            multiplicity=stop - start,
                             **network_condition_kwargs,
                         ),
+                        diffusion_precision=diffusion_precision,
                     )
-                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+                    atom_coords_denoised[start:stop] = atom_coords_denoised_chunk
+                del atom_coords_denoised_chunk
 
                 if steering_args["fk_steering"] and (
                     (

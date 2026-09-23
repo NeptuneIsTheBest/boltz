@@ -361,8 +361,8 @@ class Boltz2(LightningModule):
     def setup(self, stage: str) -> None:
         """Set the model for training, validation and inference."""
         if stage == "predict" and not (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
+            self.trainer.strategy.root_device.type == "cuda"
+            and torch.cuda.get_device_properties(self.trainer.strategy.root_device).major >= 8  # noqa: PLR2004
         ):
             self.use_kernels = False
 
@@ -408,7 +408,31 @@ class Boltz2(LightningModule):
         diffusion_samples: int = 1,
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
+        prediction_options: Optional[dict] = None,
     ) -> dict[str, Tensor]:
+        # Only predict_step opts in; training/validation and old checkpoints
+        # retain the complete forward interface and their original precision.
+        options = (prediction_options or {}) if not self.training else {}
+        low_memory = options.get("low_memory", False)
+        requested_keys = set(options.get("keys_dict_out", []))
+        confidence_keys = None
+        if low_memory:
+            confidence_keys = requested_keys | {
+                "plddt",
+                "complex_plddt",
+                "complex_iplddt",
+                "complex_pde",
+                "complex_ipde",
+                "ptm",
+                "iptm",
+                "ligand_iptm",
+                "protein_iptm",
+                "pair_chains_iptm",
+            }
+            if options.get("write_full_pae", False):
+                confidence_keys.add("pae")
+            if options.get("write_full_pde", False):
+                confidence_keys.add("pde")
         with torch.set_grad_enabled(
             self.training and self.structure_prediction_training
         ):
@@ -489,6 +513,8 @@ class Boltz2(LightningModule):
                             use_kernels=self.use_kernels,
                         )
 
+            if low_memory:
+                del s_init, z_init, mask, pair_mask
             pdistogram = self.distogram_module(z)
             dict_out = {
                 "pdistogram": pdistogram,
@@ -529,6 +555,9 @@ class Boltz2(LightningModule):
                     "atom_dec_bias": atom_dec_bias,
                     "token_trans_bias": token_trans_bias,
                 }
+                if low_memory:
+                    del q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias
+                    del relative_position_encoding
 
                 with torch.autocast(autocast_device_type(s.device.type), enabled=False):
                     struct_out = self.structure_module.sample(
@@ -541,8 +570,12 @@ class Boltz2(LightningModule):
                         max_parallel_samples=max_parallel_samples,
                         steering_args=self.steering_args,
                         diffusion_conditioning=diffusion_conditioning,
+                        diffusion_precision=options.get("diffusion_precision"),
+                        low_memory=low_memory,
                     )
                     dict_out.update(struct_out)
+                if low_memory:
+                    del diffusion_conditioning, struct_out
 
                 if self.predict_bfactor:
                     pbfactor = self.bfactor_module(s)
@@ -603,8 +636,14 @@ class Boltz2(LightningModule):
                     multiplicity=diffusion_samples,
                     run_sequentially=run_confidence_sequentially,
                     use_kernels=self.use_kernels,
+                    output_keys=confidence_keys,
+                    use_fp32_geometry=options.get("diffusion_precision") is not None,
                 )
             )
+
+        if low_memory and "pdistogram" not in requested_keys:
+            dict_out.pop("pdistogram")
+            del pdistogram
 
         if self.affinity_prediction:
             pad_token_mask = feats["token_pad_mask"][0]
@@ -627,6 +666,8 @@ class Boltz2(LightningModule):
             s_inputs = self.input_embedder(feats, affinity=True)
 
             with torch.autocast(autocast_device_type(s.device.type), enabled=False):
+                s_inputs = s_inputs.float()
+                z_affinity = z_affinity.float()
                 if self.affinity_ensemble:
                     dict_out_affinity1 = self.affinity_module1(
                         s_inputs=s_inputs.detach(),
@@ -720,6 +761,10 @@ class Boltz2(LightningModule):
                         }
                     )
 
+        if low_memory and not options.get("write_embeddings", False):
+            for key in ("s", "z"):
+                if key not in requested_keys:
+                    dict_out.pop(key, None)
         return dict_out
 
     def get_true_coordinates(
@@ -1064,6 +1109,7 @@ class Boltz2(LightningModule):
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 max_parallel_samples=self.predict_args["max_parallel_samples"],
                 run_confidence_sequentially=True,
+                prediction_options=self.predict_args,
             )
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
@@ -1072,8 +1118,11 @@ class Boltz2(LightningModule):
 
             pred_dict["masks"] = batch["atom_pad_mask"]
             pred_dict["token_masks"] = batch["token_pad_mask"]
-            pred_dict["s"] = out["s"]
-            pred_dict["z"] = out["z"]
+            if not self.predict_args.get("low_memory", False) or self.predict_args.get(
+                "write_embeddings", False
+            ):
+                pred_dict["s"] = out["s"]
+                pred_dict["z"] = out["z"]
 
             if "keys_dict_out" in self.predict_args:
                 for key in self.predict_args["keys_dict_out"]:
@@ -1081,7 +1130,8 @@ class Boltz2(LightningModule):
             pred_dict["coords"] = out["sample_atom_coords"]
             if self.confidence_prediction:
                 # pred_dict["confidence"] = out.get("ablation_confidence", None)
-                pred_dict["pde"] = out["pde"]
+                if "pde" in out:
+                    pred_dict["pde"] = out["pde"]
                 pred_dict["plddt"] = out["plddt"]
                 pred_dict["confidence_score"] = (
                     4 * out["complex_plddt"]
@@ -1099,7 +1149,8 @@ class Boltz2(LightningModule):
                 pred_dict["complex_pde"] = out["complex_pde"]
                 pred_dict["complex_ipde"] = out["complex_ipde"]
                 if self.alpha_pae > 0:
-                    pred_dict["pae"] = out["pae"]
+                    if "pae" in out:
+                        pred_dict["pae"] = out["pae"]
                     pred_dict["ptm"] = out["ptm"]
                     pred_dict["iptm"] = out["iptm"]
                     pred_dict["ligand_iptm"] = out["ligand_iptm"]

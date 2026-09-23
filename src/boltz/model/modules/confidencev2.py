@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import torch
 from torch import nn
 from torch.nn.functional import pad
@@ -13,7 +15,7 @@ from boltz.model.modules.encodersv2 import RelativePositionEncoder
 from boltz.model.modules.trunkv2 import (
     ContactConditioning,
 )
-from boltz.model.modules.utils import LinearNoBias
+from boltz.model.modules.utils import LinearNoBias, autocast_device_type
 
 
 class ConfidenceModule(nn.Module):
@@ -117,6 +119,8 @@ class ConfidenceModule(nn.Module):
         multiplicity=1,
         run_sequentially=False,
         use_kernels: bool = False,
+        output_keys=None,
+        use_fp32_geometry=False,
     ):
         if run_sequentially and multiplicity > 1:
             assert z.shape[0] == 1, "Not supported with batch size > 1"
@@ -133,6 +137,8 @@ class ConfidenceModule(nn.Module):
                         multiplicity=1,
                         run_sequentially=False,
                         use_kernels=use_kernels,
+                        output_keys=output_keys,
+                        use_fp32_geometry=use_fp32_geometry,
                     )
                 )
 
@@ -193,8 +199,14 @@ class ConfidenceModule(nn.Module):
             x_pred = x_pred.reshape(B * mult, N, -1)
         else:
             BM, N, _ = x_pred.shape
-        x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred)
-        d = torch.cdist(x_pred_repr, x_pred_repr)
+        geometry_context = (
+            torch.autocast(autocast_device_type(x_pred.device.type), enabled=False)
+            if use_fp32_geometry
+            else nullcontext()
+        )
+        with geometry_context:
+            x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred.float())
+            d = torch.cdist(x_pred_repr, x_pred_repr)
         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
         distogram = self.dist_bin_pairwise_embed(distogram)
         z = z + distogram
@@ -226,8 +238,15 @@ class ConfidenceModule(nn.Module):
                 feats=feats,
                 multiplicity=multiplicity,
                 pred_distogram_logits=pred_distogram_logits,
+                use_fp32_reductions=use_fp32_geometry,
             )
         )
+        # Filter before the sequential caller retains/concatenates this sample.
+        # Training and validation keep their complete outputs by default.
+        if output_keys is not None:
+            out_dict = {
+                key: value for key, value in out_dict.items() if key in output_keys
+            }
         return out_dict
 
 
@@ -280,6 +299,7 @@ class ConfidenceHeads(nn.Module):
         feats,
         pred_distogram_logits,
         multiplicity=1,
+        use_fp32_reductions=False,
     ):
         if self.use_separate_heads:
             asym_id_token = feats["asym_id"]
@@ -323,7 +343,9 @@ class ConfidenceHeads(nn.Module):
         is_ligand_token = (token_type == const.chain_type_ids["NONPOLYMER"]).float()
 
         if self.token_level_confidence:
-            plddt = compute_aggregated_metric(plddt_logits)
+            plddt = compute_aggregated_metric(
+                plddt_logits.float() if use_fp32_reductions else plddt_logits
+            )
             token_pad_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
             complex_plddt = (plddt * token_pad_mask).sum(dim=-1) / token_pad_mask.sum(
                 dim=-1
@@ -395,7 +417,9 @@ class ConfidenceHeads(nn.Module):
                 value=0,
             )
             atom_pad_mask = feats["atom_pad_mask"].repeat_interleave(multiplicity, 0)
-            plddt = compute_aggregated_metric(plddt_logits)
+            plddt = compute_aggregated_metric(
+                plddt_logits.float() if use_fp32_reductions else plddt_logits
+            )
 
             complex_plddt = (plddt * atom_pad_mask).sum(dim=-1) / atom_pad_mask.sum(
                 dim=-1
@@ -430,9 +454,16 @@ class ConfidenceHeads(nn.Module):
             ) / torch.sum(feats["atom_pad_mask"] * iplddt_weight, dim=-1)
 
         # Compute the gPDE and giPDE
-        pde = compute_aggregated_metric(pde_logits, end=32)
+        pde = compute_aggregated_metric(
+            pde_logits.float() if use_fp32_reductions else pde_logits, end=32
+        )
         pred_distogram_prob = nn.functional.softmax(
-            pred_distogram_logits, dim=-1
+            (
+                pred_distogram_logits.float()
+                if use_fp32_reductions
+                else pred_distogram_logits
+            ),
+            dim=-1,
         ).repeat_interleave(multiplicity, 0)
         contacts = torch.zeros(
             (1, 1, 1, 64),
@@ -475,11 +506,16 @@ class ConfidenceHeads(nn.Module):
             complex_ipde=complex_ipde,
         )
         out_dict["pae_logits"] = pae_logits
-        out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
+        out_dict["pae"] = compute_aggregated_metric(
+            pae_logits.float() if use_fp32_reductions else pae_logits, end=32
+        )
 
         try:
             ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
-                pae_logits, x_pred, feats, multiplicity
+                pae_logits.float() if use_fp32_reductions else pae_logits,
+                x_pred,
+                feats,
+                multiplicity,
             )
             out_dict["ptm"] = ptm
             out_dict["iptm"] = iptm

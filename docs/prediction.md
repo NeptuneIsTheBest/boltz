@@ -171,6 +171,35 @@ Examples of common options include:
 | `--write_full_pae`       | `FLAG`          | `False`                     | Whether to save the full PAE matrix as a file.                                                                                                                                      |
 | `--write_full_pde`       | `FLAG`          | `False`                     | Whether to save the full PDE matrix as a file.                                                                                                                                      |
 
+### Reducing Boltz-2 inference memory
+
+```bash
+boltz predict input.yaml --low_memory
+```
+
+This optional Boltz-2 mode uses BF16 on supported CUDA GPUs, FP16 otherwise,
+and FP32 on CPU. The checked BF16 examples used roughly **7–22% less peak RAM**
+and **up to 9% less peak allocated GPU memory**. Small inputs may save little GPU
+memory; savings vary with the input and requested outputs.
+
+| Option | Usage |
+| --- | --- |
+| `--precision` | Override with `32-true`, `bf16-mixed`, or `16-mixed`. CPU supports `32-true` only. |
+| `--max_parallel_samples 1` | Run one diffusion sample at a time to further reduce GPU memory; all requested samples are still generated. |
+| `--write_full_pae`, `--write_full_pde`, `--write_embeddings` | Request these larger outputs, which are omitted by default in low-memory mode. |
+| `--num_workers`, `--preprocessing-threads` | Override the low-memory defaults of 0 data workers and 1 preprocessing process. |
+
+For example, to select FP16 explicitly:
+
+```bash
+boltz predict input.yaml --low_memory --precision 16-mixed
+```
+
+Add `--no_kernels` if the optional cuEquivariance packages are not installed.
+Sample counts, inference steps and MSA contents are preserved. Inference can be
+slower, particularly for affinity, and predictions can change. Without the new
+options, the existing precision policy is retained.
+
 ## Output
 
 After running the model, the generated outputs are organized into the output directory following the structure below:

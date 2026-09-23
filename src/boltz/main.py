@@ -1,7 +1,6 @@
 import multiprocessing
 import os
 import pickle
-import platform
 import tarfile
 import urllib.request
 import warnings
@@ -13,8 +12,7 @@ from typing import Literal, Optional
 
 import click
 import torch
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning import seed_everything
 from pytorch_lightning.utilities import rank_zero_only
 from rdkit import Chem
 from tqdm import tqdm
@@ -32,6 +30,7 @@ from boltz.data.types import MSA, Manifest, Record
 from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
 from boltz.model.models.boltz1 import Boltz1
 from boltz.model.models.boltz2 import Boltz2
+from boltz.prediction import resolve_precision, run_prediction_stage
 
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
 MOL_URL = "https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar"
@@ -869,8 +868,8 @@ def cli() -> None:
 )
 @click.option(
     "--max_parallel_samples",
-    type=int,
-    help="The maximum number of samples to predict in parallel. Default is None.",
+    type=click.IntRange(min=1),
+    help="The maximum number of samples to predict in parallel. Default is 5.",
     default=5,
 )
 @click.option(
@@ -890,13 +889,13 @@ def cli() -> None:
     "--write_full_pae",
     type=bool,
     is_flag=True,
-    help="Whether to dump the pae into a npz file. Default is True.",
+    help="Request the full PAE matrix (off by default in --low_memory mode).",
 )
 @click.option(
     "--write_full_pde",
     type=bool,
     is_flag=True,
-    help="Whether to dump the pde into a npz file. Default is False.",
+    help="Request the full PDE matrix (off by default in --low_memory mode).",
 )
 @click.option(
     "--output_format",
@@ -906,9 +905,9 @@ def cli() -> None:
 )
 @click.option(
     "--num_workers",
-    type=int,
-    help="The number of dataloader workers to use for prediction. Default is 2.",
-    default=2,
+    type=click.IntRange(min=0),
+    help="Dataloader workers. Default is 2, or 0 with --low_memory.",
+    default=None,
 )
 @click.option(
     "--override",
@@ -984,9 +983,9 @@ def cli() -> None:
 )
 @click.option(
     "--preprocessing-threads",
-    type=int,
-    help="The number of threads to use for preprocessing. Default is 1.",
-    default=multiprocessing.cpu_count(),
+    type=click.IntRange(min=1),
+    help="Preprocessing processes. Default is CPU count, or 1 with --low_memory.",
+    default=None,
 )
 @click.option(
     "--affinity_mw_correction",
@@ -1039,6 +1038,17 @@ def cli() -> None:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--low_memory",
+    is_flag=True,
+    help="Reduce Boltz-2 inference memory with mixed precision and compact outputs.",
+)
+@click.option(
+    "--precision",
+    type=click.Choice(["32-true", "bf16-mixed", "16-mixed"]),
+    default=None,
+    help="Boltz-2 inference precision. Overrides the --low_memory precision default.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1057,7 +1067,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
-    num_workers: int = 2,
+    num_workers: Optional[int] = None,
     override: bool = False,
     seed: Optional[int] = None,
     use_msa_server: bool = False,
@@ -1071,14 +1081,38 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     model: Literal["boltz1", "boltz2"] = "boltz2",
     method: Optional[str] = None,
     affinity_mw_correction: Optional[bool] = False,
-    preprocessing_threads: int = 1,
+    preprocessing_threads: Optional[int] = None,
     max_msa_seqs: int = 8192,
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    low_memory: bool = False,
+    precision: Optional[str] = None,
 ) -> None:
     """Run predictions with Boltz."""
+    try:
+        trainer_precision = resolve_precision(model, accelerator, precision, low_memory)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if max_parallel_samples is not None and max_parallel_samples < 1:
+        raise click.UsageError("max_parallel_samples must be positive.")
+    if num_workers is None:
+        num_workers = 0 if low_memory else 2
+    if preprocessing_threads is None:
+        preprocessing_threads = (
+            1
+            if low_memory or click.get_current_context(silent=True) is None
+            else multiprocessing.cpu_count()
+        )
+    inference_options = {
+        "low_memory": low_memory,
+        # None keeps the legacy FP32 denoiser, even with the BF16 trunk.
+        "diffusion_precision": trainer_precision if low_memory or precision else None,
+        "write_embeddings": write_embeddings,
+    }
+    if low_memory or precision:
+        click.echo(f"Inference precision: {trainer_precision}; low memory: {low_memory}")
     # If cpu, write a friendly warning
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
@@ -1207,24 +1241,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         ),
     )
 
-    # Set up trainer
-    strategy = "auto"
-    if (isinstance(devices, int) and devices > 1) or (
-        isinstance(devices, list) and len(devices) > 1
-    ):
-        start_method = "fork" if platform.system() != "win32" and platform.system() != "Windows" else "spawn"
-        strategy = DDPStrategy(start_method=start_method)
-        if len(filtered_manifest.records) < devices:
-            msg = (
-                "Number of requested devices is greater "
-                "than the number of predictions, taking the minimum."
-            )
-            click.echo(msg)
-            if isinstance(devices, list):
-                devices = devices[: max(1, len(filtered_manifest.records))]
-            else:
-                devices = max(1, min(len(filtered_manifest.records), devices))
-
     # Set up model parameters
     if model == "boltz2":
         diffusion_params = Boltz2DiffusionParams()
@@ -1252,14 +1268,14 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         write_embeddings=write_embeddings,
     )
 
-    # Set up trainer
-    trainer = Trainer(
+    # Each stage creates its own Trainer so old weights cannot survive into
+    # checkpoint loading for the next stage.
+    trainer_kwargs = dict(
         default_root_dir=out_dir,
-        strategy=strategy,
         callbacks=[pred_writer],
         accelerator=accelerator,
         devices=devices,
-        precision=32 if model == "boltz1" else "bf16-mixed",
+        precision=trainer_precision,
     )
 
     if filtered_manifest.records:
@@ -1279,6 +1295,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 template_dir=processed.template_dir,
                 extra_mols_dir=processed.extra_mols_dir,
                 override_method=method,
+                low_memory=low_memory,
             )
         else:
             data_module = BoltzInferenceDataModule(
@@ -1304,6 +1321,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "write_confidence_summary": True,
             "write_full_pae": write_full_pae,
             "write_full_pde": write_full_pde,
+            **inference_options,
         }
 
         steering_args = BoltzSteeringParams()
@@ -1311,11 +1329,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.physical_guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
-        model_module = model_cls.load_from_checkpoint(
-            checkpoint,
-            strict=True,
+        model_kwargs = dict(
             predict_args=predict_args,
-            map_location="cpu",
             diffusion_process_args=asdict(diffusion_params),
             ema=False,
             use_kernels=not no_kernels,
@@ -1323,14 +1338,15 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
         )
-        model_module.eval()
-
-        # Compute structure predictions
-        trainer.predict(
-            model_module,
-            datamodule=data_module,
-            return_predictions=False,
+        run_prediction_stage(
+            model_cls,
+            checkpoint,
+            model_kwargs,
+            data_module,
+            trainer_kwargs,
+            num_records=len(filtered_manifest.records),
         )
+        del data_module
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):
@@ -1367,6 +1383,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             extra_mols_dir=processed.extra_mols_dir,
             override_method="other",
             affinity=True,
+            low_memory=low_memory,
         )
 
         predict_affinity_args = {
@@ -1377,6 +1394,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "write_confidence_summary": False,
             "write_full_pae": False,
             "write_full_pde": False,
+            **inference_options,
         }
 
         # Load affinity model
@@ -1388,11 +1406,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.physical_guidance_update = False
         steering_args.contact_guidance_update = False
         
-        model_module = Boltz2.load_from_checkpoint(
-            affinity_checkpoint,
-            strict=True,
+        model_kwargs = dict(
             predict_args=predict_affinity_args,
-            map_location="cpu",
             diffusion_process_args=asdict(diffusion_params),
             ema=False,
             pairformer_args=asdict(pairformer_args),
@@ -1400,13 +1415,14 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             steering_args=asdict(steering_args),
             affinity_mw_correction=affinity_mw_correction,
         )
-        model_module.eval()
-
-        trainer.callbacks[0] = pred_writer
-        trainer.predict(
-            model_module,
-            datamodule=data_module,
-            return_predictions=False,
+        trainer_kwargs["callbacks"] = [pred_writer]
+        run_prediction_stage(
+            Boltz2,
+            affinity_checkpoint,
+            model_kwargs,
+            data_module,
+            trainer_kwargs,
+            num_records=len(manifest_filtered.records),
         )
 
 

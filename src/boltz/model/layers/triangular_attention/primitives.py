@@ -182,6 +182,16 @@ def _attention(
     # [*, H, C_hidden, K]
     key = permute_final_dims(key, (1, 0))
 
+    if query.dtype == torch.float16:
+        # FP16 cannot represent the -1e9 mask bias. Keep the score reduction
+        # and softmax in FP32, including fully masked rows and large q/k values.
+        with torch.autocast(query.device.type, enabled=False):
+            a = torch.matmul(query.float(), key.float())
+            for b in biases:
+                a = a + b.float()
+            a = torch.softmax(a, dim=-1)
+            return torch.matmul(a, value.float()).to(value.dtype)
+
     # [*, H, Q, K]
     a = torch.matmul(query, key)
 

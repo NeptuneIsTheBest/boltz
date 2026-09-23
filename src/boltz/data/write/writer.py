@@ -14,6 +14,14 @@ from boltz.data.write.mmcif import to_mmcif
 from boltz.data.write.pdb import to_pdb
 
 
+def to_numpy(tensor: Tensor) -> np.ndarray:
+    """Export tensors on CPU, including BF16 which NumPy cannot represent."""
+    tensor = tensor.detach().cpu()
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.float()
+    return tensor.numpy()
+
+
 class BoltzWriter(BasePredictionWriter):
     """Custom writer for predictions."""
 
@@ -101,7 +109,7 @@ class BoltzWriter(BasePredictionWriter):
                 model_coord = coord[model_idx]
                 # Unpad
                 coord_unpad = model_coord[pad_mask.bool()]
-                coord_unpad = coord_unpad.cpu().numpy()
+                coord_unpad = to_numpy(coord_unpad)
 
                 # New atom table
                 atoms = structure.atoms
@@ -226,7 +234,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"plddt_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, plddt=plddt.cpu().numpy())
+                    np.savez_compressed(path, plddt=to_numpy(plddt))
 
                 # Save pae
                 if "pae" in prediction:
@@ -235,7 +243,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"pae_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, pae=pae.cpu().numpy())
+                    np.savez_compressed(path, pae=to_numpy(pae))
 
                 # Save pde
                 if "pde" in prediction:
@@ -244,12 +252,12 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, pde=pde.cpu().numpy())
+                    np.savez_compressed(path, pde=to_numpy(pde))
                 
             # Save embeddings
             if self.write_embeddings and "s" in prediction and "z" in prediction:
-                s = prediction["s"].cpu().numpy()
-                z = prediction["z"].cpu().numpy()
+                s = to_numpy(prediction["s"])
+                z = to_numpy(prediction["z"])
 
                 path = (
                     struct_dir

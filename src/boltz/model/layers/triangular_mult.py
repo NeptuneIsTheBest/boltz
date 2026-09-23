@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import torch
 from torch import Tensor, nn
 
@@ -108,6 +110,7 @@ class TriangleMultiplicationOutgoing(nn.Module):
         x = self.norm_in(x)
         x_in = x
         x = self.p_in(x) * self.g_in(x).sigmoid()
+        fp16_projection = x.dtype == torch.float16
 
         # Apply mask
         x = x * mask.unsqueeze(-1)
@@ -116,7 +119,14 @@ class TriangleMultiplicationOutgoing(nn.Module):
         a, b = torch.chunk(x.float(), 2, dim=-1)
 
         # Triangular projection
-        x = torch.einsum("bikd,bjkd->bijd", a, b)
+        # A float() input alone does not prevent autocast from narrowing the
+        # contraction. FP16 overflows here with the released Boltz-2 weights.
+        with (
+            torch.autocast(x.device.type, enabled=False)
+            if fp16_projection
+            else nullcontext()
+        ):
+            x = torch.einsum("bikd,bjkd->bijd", a, b)
 
         # Output gating
         x = self.p_out(self.norm_out(x)) * self.g_out(x_in).sigmoid()
@@ -196,6 +206,7 @@ class TriangleMultiplicationIncoming(nn.Module):
         x = self.norm_in(x)
         x_in = x
         x = self.p_in(x) * self.g_in(x).sigmoid()
+        fp16_projection = x.dtype == torch.float16
 
         # Apply mask
         x = x * mask.unsqueeze(-1)
@@ -204,7 +215,12 @@ class TriangleMultiplicationIncoming(nn.Module):
         a, b = torch.chunk(x.float(), 2, dim=-1)
 
         # Triangular projection
-        x = torch.einsum("bkid,bkjd->bijd", a, b)
+        with (
+            torch.autocast(x.device.type, enabled=False)
+            if fp16_projection
+            else nullcontext()
+        ):
+            x = torch.einsum("bkid,bkjd->bijd", a, b)
 
         # Output gating
         x = self.p_out(self.norm_out(x)) * self.g_out(x_in).sigmoid()

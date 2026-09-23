@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import torch
 from torch import Tensor, nn
 
@@ -50,8 +52,11 @@ class OuterProductMean(nn.Module):
 
         # Compute projections
         m = self.norm(m)
-        a = self.proj_a(m) * mask
-        b = self.proj_b(m) * mask
+        a = self.proj_a(m)
+        b = self.proj_b(m)
+        fp16_projection = a.dtype == torch.float16
+        a = a * mask
+        b = b * mask
 
         # Compute outer product mean
         if chunk_size is not None and not self.training:
@@ -74,7 +79,16 @@ class OuterProductMean(nn.Module):
                     :, i * self.c_hidden : (i + chunk_size) * self.c_hidden
                 ]
 
-                z = torch.einsum("bsic,bsjd->bijcd", a_chunk, b)
+                with (
+                    torch.autocast(m.device.type, enabled=False)
+                    if fp16_projection
+                    else nullcontext()
+                ):
+                    z = torch.einsum(
+                        "bsic,bsjd->bijcd",
+                        a_chunk.float() if fp16_projection else a_chunk,
+                        b.float() if fp16_projection else b,
+                    )
                 z = z.reshape(*z.shape[:3], -1)
                 z = z / num_mask
 
@@ -89,7 +103,12 @@ class OuterProductMean(nn.Module):
         else:
             mask = mask[:, :, None, :] * mask[:, :, :, None]
             num_mask = mask.sum(1).clamp(min=1)
-            z = torch.einsum("bsic,bsjd->bijcd", a.float(), b.float())
+            with (
+                torch.autocast(m.device.type, enabled=False)
+                if fp16_projection
+                else nullcontext()
+            ):
+                z = torch.einsum("bsic,bsjd->bijcd", a.float(), b.float())
             z = z.reshape(*z.shape[:3], -1)
             z = z / num_mask
 
