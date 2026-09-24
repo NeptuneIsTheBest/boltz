@@ -21,6 +21,7 @@ from einops import rearrange
 from torch import nn
 
 from boltz.model.layers import initialize
+from boltz.model.layers.triangle_inference import use_bf16_triangle_inference
 from boltz.model.layers.triangular_attention.utils import (
     flatten_final_dims,
     permute_final_dims,
@@ -206,6 +207,48 @@ def _attention(
     return a
 
 
+def _attention_inference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    tri_bias: torch.Tensor,
+    mask_bias: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Use one aligned bias buffer and a fused reduction, or release it and decline."""
+    if query.ndim != 4 or query.dtype != torch.bfloat16:
+        return None
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:
+        # Older supported PyTorch versions keep the existing attention path.
+        return None
+
+    # CUTLASS requires aligned row strides even for odd sequence lengths. Slice
+    # only the storage padding; padded keys never participate in attention.
+    keys = key.shape[-2]
+    aligned_keys = (keys + 7) // 8 * 8
+    bias = query.new_empty((*query.shape[:-2], query.shape[-2], aligned_keys))
+    bias = bias[..., :keys]
+    # The projection has a head-last layout. Filling the final buffer directly
+    # avoids materializing both a broadcast bias and its contiguous copy.
+    torch.add(tri_bias, mask_bias.to(query.dtype), out=bias)
+    try:
+        params = torch.backends.cuda.SDPAParams(
+            query, key, value, bias, 0.0, False, False
+        )
+    except TypeError:
+        params = torch.backends.cuda.SDPAParams(query, key, value, bias, 0.0, False)
+    if not torch.backends.cuda.can_use_efficient_attention(params):
+        return None
+    # Never silently dispatch to the math backend with the large bias alive.
+    # Q has already been scaled by _prep_qkv; applying the default scale again
+    # would change the model. Keep the finite mask bias, including masked rows.
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        return nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=bias, dropout_p=0.0, scale=1.0
+        )
+
+
 @torch.compiler.disable
 def kernel_triangular_attn(q, k, v, tri_bias, mask, scale):
     from cuequivariance_torch.primitives.triangle import triangle_attention
@@ -253,6 +296,7 @@ class Attention(nn.Module):
         self.c_hidden = c_hidden
         self.no_heads = no_heads
         self.gating = gating
+        self.inference_optimized = False
 
         # DISCREPANCY: c_hidden is not the per-head channel dimension, as
         # stated in the supplement, but the overall channel dimension.
@@ -368,7 +412,11 @@ class Attention(nn.Module):
             o = o.transpose(-2, -3)
         else:
             biases = [mask_bias, tri_bias]
-            o = _attention(q, k, v, biases)
+            o = None
+            if use_bf16_triangle_inference(self, q_x):
+                o = _attention_inference(q, k, v, tri_bias, mask_bias)
+            if o is None:
+                o = _attention(q, k, v, biases)
             o = o.transpose(-2, -3)
 
         o = self._wrap_up(o, q_x)

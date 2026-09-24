@@ -4,6 +4,25 @@ import torch
 from torch import Tensor, nn
 
 from boltz.model.layers import initialize as init
+from boltz.model.layers.triangle_inference import use_bf16_triangle_inference
+
+
+def _inference_forward(module: nn.Module, x: Tensor, mask: Tensor, equation: str) -> Tensor:
+    """Reuse owned BF16 buffers without changing the autocast contraction."""
+    normalized = module.norm_in(x)
+    projected = module.p_in(normalized)
+    gate = module.g_in(normalized).sigmoid_()
+    projected.mul_(gate)
+    del gate
+    projected.mul_(mask.unsqueeze(-1))
+    a, b = projected.chunk(2, dim=-1)
+    # The original FP32 intermediates are narrowed back to BF16 by einsum's
+    # autocast policy. Keeping the projection in BF16 avoids that round trip.
+    output = torch.einsum(equation, a, b)
+    del a, b, projected
+    output = module.p_out(module.norm_out(output))
+    output.mul_(module.g_out(normalized).sigmoid_())
+    return output
 
 
 @torch.compiler.disable
@@ -51,6 +70,8 @@ class TriangleMultiplicationOutgoing(nn.Module):
 
         """
         super().__init__()
+
+        self.inference_optimized = False
 
         self.norm_in = nn.LayerNorm(dim, eps=1e-5)
         self.p_in = nn.Linear(dim, 2 * dim, bias=False)
@@ -106,6 +127,9 @@ class TriangleMultiplicationOutgoing(nn.Module):
                 eps=1e-5,
             )
 
+        if use_bf16_triangle_inference(self, x):
+            return _inference_forward(self, x, mask, "bikd,bjkd->bijd")
+
         # Input gating: D -> D
         x = self.norm_in(x)
         x_in = x
@@ -147,6 +171,8 @@ class TriangleMultiplicationIncoming(nn.Module):
 
         """
         super().__init__()
+
+        self.inference_optimized = False
 
         self.norm_in = nn.LayerNorm(dim, eps=1e-5)
         self.p_in = nn.Linear(dim, 2 * dim, bias=False)
@@ -201,6 +227,9 @@ class TriangleMultiplicationIncoming(nn.Module):
                 g_out_weight=self.g_out.weight,
                 eps=1e-5,
             )
+
+        if use_bf16_triangle_inference(self, x):
+            return _inference_forward(self, x, mask, "bkid,bkjd->bijd")
 
         # Input gating: D -> D
         x = self.norm_in(x)

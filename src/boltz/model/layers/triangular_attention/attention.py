@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from boltz.model.layers.triangle_inference import use_bf16_triangle_inference
 from boltz.model.layers.triangular_attention.primitives import (
     Attention,
     LayerNorm,
@@ -48,6 +49,7 @@ class TriangleAttention(nn.Module):
         self.no_heads = no_heads
         self.starting = starting
         self.inf = inf
+        self.inference_optimized = False
 
         self.layer_norm = LayerNorm(self.c_in)
 
@@ -131,6 +133,9 @@ class TriangleAttention(nn.Module):
             Output tensor of shape [*, I, J, C_in]
 
         """
+        if not use_kernels and use_bf16_triangle_inference(self, x):
+            chunk_size = min(chunk_size, 128) if chunk_size is not None else 128
+
         if mask is None:
             # [*, I, J]
             mask = x.new_ones(

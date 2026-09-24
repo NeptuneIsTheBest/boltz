@@ -1031,7 +1031,7 @@ def cli() -> None:
 @click.option(
     "--no_kernels",
     is_flag=True,
-    help="Whether to disable the kernels. Default False",
+    help="Disable optional cuEquivariance kernels. Default False",
 )
 @click.option(
     "--write_embeddings",

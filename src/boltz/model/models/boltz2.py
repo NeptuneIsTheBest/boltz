@@ -14,6 +14,12 @@ from boltz.data.mol import (
     minimum_lddt_symmetry_coords,
 )
 from boltz.model.layers.pairformer import PairformerModule
+from boltz.model.layers.triangle_inference import use_bf16_triangle_inference
+from boltz.model.layers.triangular_attention.attention import TriangleAttention
+from boltz.model.layers.triangular_mult import (
+    TriangleMultiplicationIncoming,
+    TriangleMultiplicationOutgoing,
+)
 from boltz.model.loss.bfactor import bfactor_loss_fn
 from boltz.model.loss.confidencev2 import (
     confidence_loss,
@@ -162,6 +168,7 @@ class Boltz2(LightningModule):
 
         # Kernels
         self.use_kernels = use_kernels
+        self.inference_optimized = False
 
         # Input embeddings
         full_embedder_args = {
@@ -360,6 +367,31 @@ class Boltz2(LightningModule):
 
     def setup(self, stage: str) -> None:
         """Set the model for training, validation and inference."""
+        # Ordinary attributes do not add parameters, buffers or checkpoint keys.
+        # Each call still checks eval/no-grad/CUDA BF16 before using this path.
+        optimize_triangles = stage == "predict" and bool(
+            (self.predict_args or {}).get("low_memory", False)
+        )
+        self.inference_optimized = optimize_triangles
+        for name, module in self.named_modules():
+            if isinstance(module, TriangleAttention):
+                # Fused BF16 score reductions change rounding. Repeating them
+                # through the structure trunk can change sampled conformations,
+                # despite small single-layer errors. Only score already sampled
+                # structures with this path; leave trunk/MSA/templates unchanged.
+                score_module = name.split(".", 1)[0] in {
+                    "confidence_module",
+                    "affinity_module",
+                    "affinity_module1",
+                    "affinity_module2",
+                }
+                module.inference_optimized = optimize_triangles and score_module
+                module.mha.inference_optimized = module.inference_optimized
+            elif isinstance(
+                module, (TriangleMultiplicationIncoming, TriangleMultiplicationOutgoing)
+            ):
+                module.inference_optimized = optimize_triangles
+
         if stage == "predict" and not (
             self.trainer.strategy.root_device.type == "cuda"
             and torch.cuda.get_device_properties(self.trainer.strategy.root_device).major >= 8  # noqa: PLR2004
@@ -398,6 +430,16 @@ class Boltz2(LightningModule):
             assert set(all_validator_names) == {
                 x["label"] for x in self.val_group_mapper.values()
             }, msg
+
+    def _release_triangle_workspace(self, x: Tensor, low_memory: bool) -> None:
+        """Drop unused native triangle allocator blocks before a different workload."""
+        if (
+            low_memory
+            and not self.affinity_prediction
+            and not self.use_kernels
+            and use_bf16_triangle_inference(self, x)
+        ):
+            torch.cuda.empty_cache()
 
     def forward(
         self,
@@ -558,6 +600,10 @@ class Boltz2(LightningModule):
                 if low_memory:
                     del q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias
                     del relative_position_encoding
+
+                # Buffer reuse changes free-block layout. Do not carry unused
+                # triangle segments into denoising's different allocation sizes.
+                self._release_triangle_workspace(s, low_memory)
 
                 with torch.autocast(autocast_device_type(s.device.type), enabled=False):
                     struct_out = self.structure_module.sample(
