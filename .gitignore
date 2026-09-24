@@ -164,6 +164,3 @@ cython_debug/
 # Boltz prediction outputs
 #   All result files generated from a boltz prediction call
 boltz_results_*/
-
-# Reproducible TRPV1 screening data, model weights and predictions
-/runs/trpv1/
